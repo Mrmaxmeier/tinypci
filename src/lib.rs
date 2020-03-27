@@ -55,6 +55,7 @@ pub struct PciDeviceInfo {
     pub full_class: PciFullClass,
     pub header_type: u8,
     pub bars: [u32; 6],
+    pub bar_sizes: [u32; 6],
     pub supported_fns: [bool; 8],
     pub interrupt_line: u8,
     pub interrupt_pin: u8,
@@ -68,14 +69,32 @@ impl PciDeviceInfo {
     pub fn subclass(&self) -> PciClass {
         PciClass::from_u8((self.full_class.as_u16() & 0xFF) as u8)
     }
+
+    pub fn enable_bus_mastering(&self) {
+        unsafe {
+            let mut val = pci_config_read(self.bus, self.device, 0, 0x04);
+            val |= 1 << 2;
+            val |= 1 << 0;
+            pci_config_write(self.bus, self.device, 0, 0x04, val);
+        }
+    }
 }
 impl Display for PciDeviceInfo {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
         let vendor_name = name_for_vendor_id(self.vendor_id);
-        writeln!(f, "Device {:X} | Bus {:X} | Vendor: {}", self.device, self.bus, vendor_name)?;
-        writeln!(f, "    Class: {:?} ({:#06X})", self.full_class, self.full_class.as_u16())?;
+        writeln!(
+            f,
+            "Device {:X} | Bus {:X} | Vendor: {}",
+            self.device, self.bus, vendor_name
+        )?;
+        writeln!(
+            f,
+            "    Class: {:?} ({:#06X})",
+            self.full_class,
+            self.full_class.as_u16()
+        )?;
         writeln!(f, "    Header type: {:X}", self.header_type)?;
-        write!(f,   "    Supported functions: 0")?;
+        write!(f, "    Supported functions: 0")?;
         for (i, b) in self.supported_fns.iter().enumerate().skip(1) {
             if *b {
                 write!(f, ", {}", i)?;
@@ -86,17 +105,19 @@ impl Display for PciDeviceInfo {
         for i in self.bars.iter() {
             if *i == 0 {
                 write!(f, "0x0 ")?;
-            }
-            else {
+            } else {
                 write!(f, "{:#010X} ", i)?;
             }
         }
         writeln!(f, "]")?;
-        writeln!(f, "    Interrupt line / pin: {} / {}", self.interrupt_line, self.interrupt_pin)?;
+        writeln!(
+            f,
+            "    Interrupt line / pin: {} / {}",
+            self.interrupt_line, self.interrupt_pin
+        )?;
         Ok(())
     }
 }
-
 
 // Public functions ////////////////////////////////////////////////////////////
 
@@ -105,7 +126,7 @@ pub fn name_for_vendor_id(vendor_id: u16) -> String {
     match vendor_id {
         0x8086 => "Intel Corp. (0x8086)".into(),
         0x1234 => "QEMU (0x1234)".into(),
-        _ => format!("Unknown({:#06X})", vendor_id)
+        _ => format!("Unknown({:#06X})", vendor_id),
     }
 }
 
@@ -121,7 +142,6 @@ pub fn brute_force_scan() -> Vec<PciDeviceInfo> {
     }
     infos
 }
-
 
 // Internal functions //////////////////////////////////////////////////////////
 
@@ -153,6 +173,7 @@ fn check_device(bus: u8, device: u8) -> Option<PciDeviceInfo> {
     }
 
     let mut bars = [0, 0, 0, 0, 0, 0];
+    let mut bar_sizes = [0, 0, 0, 0, 0, 0];
     unsafe {
         bars[0] = pci_config_read(bus, device, 0, 0x10);
         bars[1] = pci_config_read(bus, device, 0, 0x14);
@@ -160,15 +181,26 @@ fn check_device(bus: u8, device: u8) -> Option<PciDeviceInfo> {
         bars[3] = pci_config_read(bus, device, 0, 0x1C);
         bars[4] = pci_config_read(bus, device, 0, 0x20);
         bars[5] = pci_config_read(bus, device, 0, 0x24);
+
+        bar_sizes[0] = bar_read_size(bus, device, 0, 0x10);
+        bar_sizes[1] = bar_read_size(bus, device, 0, 0x14);
+        bar_sizes[2] = bar_read_size(bus, device, 0, 0x18);
+        bar_sizes[3] = bar_read_size(bus, device, 0, 0x1C);
+        bar_sizes[4] = bar_read_size(bus, device, 0, 0x20);
+        bar_sizes[5] = bar_read_size(bus, device, 0, 0x24);
     }
 
     let last_row = unsafe { pci_config_read(bus, device, 0, 0x3C) };
 
     Some(PciDeviceInfo {
-        device, bus, device_id, vendor_id,
+        device,
+        bus,
+        device_id,
+        vendor_id,
         full_class: pci_class,
         header_type,
         bars,
+        bar_sizes,
         supported_fns,
         interrupt_line: (last_row & 0xFF) as u8,
         interrupt_pin: ((last_row >> 8) & 0xFF) as u8,
@@ -181,7 +213,8 @@ unsafe fn pci_config_read(bus: u8, device: u8, func: u8, offset: u8) -> u32 {
     let func = func as u32;
     let offset = offset as u32;
     // construct address param
-    let address = ((bus << 16) | (device << 11) | (func << 8) | (offset & 0xfc) | 0x80000000) as u32;
+    let address =
+        ((bus << 16) | (device << 11) | (func << 8) | (offset & 0xfc) | 0x80000000) as u32;
 
     // write address
     write_to_port(0xCF8, address);
@@ -197,13 +230,24 @@ unsafe fn pci_config_write(bus: u8, device: u8, func: u8, offset: u8, value: u32
     let func = func as u32;
     let offset = offset as u32;
     // construct address param
-    let address = ((bus << 16) | (device << 11) | (func << 8) | (offset & 0xfc) | 0x80000000) as u32;
+    let address =
+        ((bus << 16) | (device << 11) | (func << 8) | (offset & 0xfc) | 0x80000000) as u32;
 
     // write address
     write_to_port(0xCF8, address);
 
     // write data
     write_to_port(0xCFC, value)
+}
+
+unsafe fn bar_read_size(bus: u8, device: u8, func: u8, offset: u8) -> u32 {
+    let orig = pci_config_read(bus, device, func, offset);
+    pci_config_write(bus, device, func, offset, 0xffffffff);
+    let mut space_size = pci_config_read(bus, device, func, offset);
+    pci_config_write(bus, device, func, offset, orig);
+    space_size &= 0xfffffff0;
+    space_size = (!space_size).wrapping_add(1);
+    return space_size;
 }
 
 fn get_header_type(bus: u8, device: u8, function: u8) -> u8 {
